@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Generated market data caches and outputs
+data/
+output/
+screening_output/
+agents_data_package/
+
+# Local build / editor noise
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/

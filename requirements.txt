@@ -1,0 +1,14 @@
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+requests
+yfinance
+yahooquery
+pyarrow
+python-dotenv
+lxml
+html5lib
+beautifulsoup4
+tqdm
