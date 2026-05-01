@@ -437,7 +437,7 @@ def quadratic_log_fit_r2(price_series: pd.Series) -> Tuple[float, float]:
 
 
 def analyze_one_stock(series: pd.Series, cfg: PipelineConfig) -> Optional[dict]:
-    s = pd.Series(series).dropna().copy()
+    s = pd.to_numeric(pd.Series(series), errors="coerce").dropna().copy()
     if len(s) < cfg.min_trading_days:
         return None
     if s.iloc[0] <= 0 or s.iloc[-1] <= 0:
@@ -465,14 +465,14 @@ def analyze_one_stock(series: pd.Series, cfg: PipelineConfig) -> Optional[dict]:
         return None
 
     x_old = np.arange(len(old_s))
-    y_old = np.log(old_s.values)
+    y_old = np.log(old_s.to_numpy(dtype=float))
     reg_old = linregress(x_old, y_old)
     old_log_slope = float(reg_old.slope)
     old_r2 = float(reg_old.rvalue ** 2)
     old_tnr = trend_to_noise_ratio(old_s)
 
     x_recent = np.arange(len(recent_s))
-    y_recent = np.log(recent_s.values)
+    y_recent = np.log(recent_s.to_numpy(dtype=float))
     reg_recent = linregress(x_recent, y_recent)
     recent_log_slope = float(reg_recent.slope)
     recent_r2 = float(reg_recent.rvalue ** 2)
