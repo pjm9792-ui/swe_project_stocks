@@ -12,3 +12,5 @@ lxml
 html5lib
 beautifulsoup4
 tqdm
+pymongo
+Flask

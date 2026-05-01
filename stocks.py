@@ -10,7 +10,7 @@ import warnings
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -24,6 +24,8 @@ from matplotlib.backends.backend_pdf import PdfPages
 from scipy.stats import linregress
 from tqdm.auto import tqdm
 from yahooquery import Ticker
+
+from mongo_store import get_mongo_store
 
 warnings.filterwarnings("ignore")
 load_dotenv()
@@ -70,6 +72,7 @@ DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "output"
 SCREENING_OUTPUT_DIR = BASE_DIR / "screening_output"
 AGENTS_DATA_PACKAGE_DIR = BASE_DIR / "agents_data_package"
+CHART_IMAGES_DIR = SCREENING_OUTPUT_DIR / "chart_images"
 PRICE_FEATHER = DATA_DIR / "small_midcap_prices_3y.feather"
 META_FEATHER = DATA_DIR / "small_midcap_meta.feather"
 INSIDER_FEATHER = DATA_DIR / "insider_latest.feather"
@@ -971,69 +974,148 @@ def validate_insider_coverage(df: pd.DataFrame, min_ratio: float) -> None:
         )
 
 
-def build_chart_pdf_for_screening(
-    final_df: pd.DataFrame, price_wide: pd.DataFrame, cfg: PipelineConfig, output_pdf: Path, top_n: int = 50
-) -> None:
-    output_pdf.parent.mkdir(parents=True, exist_ok=True)
-    target_start = pd.Timestamp.now().normalize() - pd.DateOffset(months=cfg.lookback_months)
-    sort_cols = [c for c in ["combined_score", "technical_score", "insider_score_60d", "total_return_pct"] if c in final_df.columns]
-    ranked = final_df.sort_values(by=sort_cols, ascending=False).head(top_n) if sort_cols else final_df.head(top_n)
+def rank_screening_df(final_df: pd.DataFrame) -> pd.DataFrame:
+    out = final_df.copy()
+    sort_cols = [c for c in ["combined_score", "technical_score", "insider_score_60d", "total_return_pct"] if c in out.columns]
+    if sort_cols:
+        out = out.sort_values(by=sort_cols, ascending=False).reset_index(drop=True)
+    else:
+        out = out.reset_index(drop=True)
+    out["screen_rank"] = np.arange(1, len(out) + 1)
+    return out
 
+
+def select_rank_range(final_df: pd.DataFrame, start_rank: int = 1, end_rank: Optional[int] = None) -> pd.DataFrame:
+    ranked = final_df.copy()
+    if "screen_rank" not in ranked.columns:
+        ranked = rank_screening_df(ranked)
+    start_rank = max(1, int(start_rank))
+    end_rank = int(end_rank) if end_rank is not None else int(ranked["screen_rank"].max())
+    end_rank = max(start_rank, end_rank)
+    return ranked[(ranked["screen_rank"] >= start_rank) & (ranked["screen_rank"] <= end_rank)].copy()
+
+
+def resolve_rank_bounds(total_count: int, start_rank: int, end_rank: Optional[int], label: str) -> Tuple[int, int]:
+    if total_count <= 0:
+        raise ValueError(f"No screened stocks are available for {label}.")
+
+    normalized_start = max(1, int(start_rank))
+    if normalized_start != int(start_rank):
+        print(f"{label}: adjusted start rank from {start_rank} to {normalized_start}.")
+
+    if normalized_start > total_count:
+        raise ValueError(
+            f"{label}: start rank {normalized_start} exceeds available screened stocks ({total_count})."
+        )
+
+    normalized_end = total_count if end_rank is None else max(normalized_start, int(end_rank))
+    if normalized_end > total_count:
+        print(f"{label}: adjusted end rank from {normalized_end} to {total_count}.")
+        normalized_end = total_count
+
+    return normalized_start, normalized_end
+
+
+def _build_chart_figure(row: pd.Series, price_wide: pd.DataFrame, cfg: PipelineConfig):
+    target_start = pd.Timestamp.now().normalize() - pd.DateOffset(months=cfg.lookback_months)
+    ticker = str(row["Ticker"]).upper()
+    if ticker not in price_wide.columns:
+        return None
+    s = price_wide[ticker].dropna()
+    s = s[s.index >= target_start]
+    if len(s) < max(20, cfg.min_trading_days):
+        return None
+    if (s <= 0).any():
+        return None
+
+    n = len(s)
+    mid = n // 2
+    old_s = s.iloc[:mid].copy()
+    recent_s = s.iloc[mid:].copy()
+    if len(old_s) < 5 or len(recent_s) < 5:
+        return None
+
+    log_s = np.log(s)
+
+    x_old = np.arange(len(old_s))
+    y_old = np.log(old_s.values)
+    reg_old = linregress(x_old, y_old)
+    yhat_old = reg_old.intercept + reg_old.slope * x_old
+
+    x_recent = np.arange(len(recent_s))
+    y_recent = np.log(recent_s.values)
+    reg_recent = linregress(x_recent, y_recent)
+    yhat_recent = reg_recent.intercept + reg_recent.slope * x_recent
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(s.index, log_s.values, label="Actual log-price", linewidth=2)
+    ax.plot(old_s.index, yhat_old, label=f"Old-half fit | slope={reg_old.slope:.5f}, R2={reg_old.rvalue**2:.3f}", linewidth=2)
+    ax.plot(recent_s.index, yhat_recent, label=f"Recent-half fit | slope={reg_recent.slope:.5f}, R2={reg_recent.rvalue**2:.3f}", linewidth=2)
+    ax.axvline(s.index[mid], linestyle="--", alpha=0.7, label="Split point")
+    ax.grid(True, alpha=0.3)
+    insider_score = row.get("insider_score_60d", np.nan)
+    buy_dollars = row.get("buy_dollars_60d", np.nan)
+    unique_buyers = row.get("unique_buyers_60d", np.nan)
+    insider_txt = "MISSING" if pd.isna(insider_score) else f"{float(insider_score):.2f}"
+    buy_txt = "MISSING" if pd.isna(buy_dollars) else f"{float(buy_dollars):,.0f}"
+    ub_txt = "MISSING" if pd.isna(unique_buyers) else f"{int(unique_buyers)}"
+    title = (
+        f"{ticker} | Rank={int(row.get('screen_rank', -1))} | Combined={row.get('combined_score', np.nan):.3f} | "
+        f"Tech={row.get('technical_score', np.nan):.3f} | "
+        f"Insider={insider_txt} | Buy$60d={buy_txt} | UniqueBuyers={ub_txt}"
+    )
+    ax.set_title(title)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Log Price")
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def build_chart_images_for_screening(
+    final_df: pd.DataFrame, price_wide: pd.DataFrame, cfg: PipelineConfig, output_dir: Path
+) -> pd.DataFrame:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    ranked = rank_screening_df(final_df)
+    for _, row in ranked.iterrows():
+        fig = _build_chart_figure(row, price_wide, cfg)
+        if fig is None:
+            continue
+        ticker = str(row["Ticker"]).upper()
+        image_path = output_dir / f"{int(row['screen_rank']):03d}_{ticker}.png"
+        fig.savefig(image_path, dpi=160)
+        plt.close(fig)
+        rows.append(
+            {
+                "Ticker": ticker,
+                "screen_rank": int(row["screen_rank"]),
+                "chart_image_path": str(image_path),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_chart_pdf_for_screening(
+    final_df: pd.DataFrame,
+    price_wide: pd.DataFrame,
+    cfg: PipelineConfig,
+    output_pdf: Path,
+    start_rank: int = 1,
+    end_rank: Optional[int] = None,
+) -> pd.DataFrame:
+    output_pdf.parent.mkdir(parents=True, exist_ok=True)
+    ranked = select_rank_range(final_df, start_rank=start_rank, end_rank=end_rank)
+    included_rows = []
     with PdfPages(output_pdf) as pdf:
         for _, row in ranked.iterrows():
-            ticker = str(row["Ticker"]).upper()
-            if ticker not in price_wide.columns:
+            fig = _build_chart_figure(row, price_wide, cfg)
+            if fig is None:
                 continue
-            s = price_wide[ticker].dropna()
-            s = s[s.index >= target_start]
-            if len(s) < max(20, cfg.min_trading_days):
-                continue
-            if (s <= 0).any():
-                continue
-
-            n = len(s)
-            mid = n // 2
-            old_s = s.iloc[:mid].copy()
-            recent_s = s.iloc[mid:].copy()
-            if len(old_s) < 5 or len(recent_s) < 5:
-                continue
-
-            log_s = np.log(s)
-
-            x_old = np.arange(len(old_s))
-            y_old = np.log(old_s.values)
-            reg_old = linregress(x_old, y_old)
-            yhat_old = reg_old.intercept + reg_old.slope * x_old
-
-            x_recent = np.arange(len(recent_s))
-            y_recent = np.log(recent_s.values)
-            reg_recent = linregress(x_recent, y_recent)
-            yhat_recent = reg_recent.intercept + reg_recent.slope * x_recent
-
-            fig, ax = plt.subplots(figsize=(12, 6))
-            ax.plot(s.index, log_s.values, label="Actual log-price", linewidth=2)
-            ax.plot(old_s.index, yhat_old, label=f"Old-half fit | slope={reg_old.slope:.5f}, R2={reg_old.rvalue**2:.3f}", linewidth=2)
-            ax.plot(recent_s.index, yhat_recent, label=f"Recent-half fit | slope={reg_recent.slope:.5f}, R2={reg_recent.rvalue**2:.3f}", linewidth=2)
-            ax.axvline(s.index[mid], linestyle="--", alpha=0.7, label="Split point")
-            ax.grid(True, alpha=0.3)
-            insider_score = row.get("insider_score_60d", np.nan)
-            buy_dollars = row.get("buy_dollars_60d", np.nan)
-            unique_buyers = row.get("unique_buyers_60d", np.nan)
-            insider_txt = "MISSING" if pd.isna(insider_score) else f"{float(insider_score):.2f}"
-            buy_txt = "MISSING" if pd.isna(buy_dollars) else f"{float(buy_dollars):,.0f}"
-            ub_txt = "MISSING" if pd.isna(unique_buyers) else f"{int(unique_buyers)}"
-            title = (
-                f"{ticker} | Combined={row.get('combined_score', np.nan):.3f} | "
-                f"Tech={row.get('technical_score', np.nan):.3f} | "
-                f"Insider={insider_txt} | Buy$60d={buy_txt} | UniqueBuyers={ub_txt}"
-            )
-            ax.set_title(title)
-            ax.set_xlabel("Date")
-            ax.set_ylabel("Log Price")
-            ax.legend()
-            fig.tight_layout()
+            included_rows.append({"Ticker": str(row["Ticker"]).upper(), "screen_rank": int(row["screen_rank"])})
             pdf.savefig(fig)
             plt.close(fig)
+    return pd.DataFrame(included_rows)
 
 
 def _safe_filename(text: str) -> str:
@@ -1320,6 +1402,7 @@ def ensure_dirs() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     SCREENING_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     AGENTS_DATA_PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
+    CHART_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1339,6 +1422,30 @@ def parse_args() -> argparse.Namespace:
         "--refresh-insider",
         action="store_true",
         help="Force insider cache refresh (ignore insider cache freshness).",
+    )
+    parser.add_argument(
+        "--chart-start-rank",
+        type=int,
+        default=1,
+        help="Start rank for the screening chart PDF bundle.",
+    )
+    parser.add_argument(
+        "--chart-end-rank",
+        type=int,
+        default=50,
+        help="End rank for the screening chart PDF bundle.",
+    )
+    parser.add_argument(
+        "--package-start-rank",
+        type=int,
+        default=1,
+        help="Start rank for building per-ticker agent data packages.",
+    )
+    parser.add_argument(
+        "--package-end-rank",
+        type=int,
+        default=None,
+        help="End rank for building per-ticker agent data packages. Defaults to all screened names.",
     )
     return parser.parse_args()
 
@@ -1402,25 +1509,100 @@ def main() -> None:
         universe_meta=universe_meta,
         insider_threshold=cfg.insider_score_threshold,
     )
+    final_df = rank_screening_df(final_df)
+    chart_start_rank, chart_end_rank = resolve_rank_bounds(
+        len(final_df),
+        args.chart_start_rank,
+        args.chart_end_rank,
+        label="Chart range",
+    )
+    package_start_rank, package_end_rank = resolve_rank_bounds(
+        len(final_df),
+        args.package_start_rank,
+        args.package_end_rank,
+        label="Package range",
+    )
+    package_df = select_rank_range(final_df, start_rank=package_start_rank, end_rank=package_end_rank)
 
     insider_ranked_path = SCREENING_OUTPUT_DIR / "insider_ranked.csv"
     combined_ranked_path = SCREENING_OUTPUT_DIR / "combined_ranked.csv"
     feather_path = SCREENING_OUTPUT_DIR / "final_screening_union.feather"
     csv_path = SCREENING_OUTPUT_DIR / "final_screening_union.csv"
     pdf_path = SCREENING_OUTPUT_DIR / "final_screening_charts.pdf"
+    chart_manifest_path = SCREENING_OUTPUT_DIR / "chart_manifest.csv"
 
     insider_ranked_df.to_csv(insider_ranked_path, index=False)
     combined_df.to_csv(combined_ranked_path, index=False)
     save_feather(final_df, feather_path)
     final_df.to_csv(csv_path, index=False)
 
-    print("7) Generating chart PDF for top 50 screening names...")
-    build_chart_pdf_for_screening(final_df, price_wide, cfg, pdf_path, top_n=50)
+    print("7) Generating chart artifacts for screening names...")
+    chart_manifest_df = build_chart_images_for_screening(final_df, price_wide, cfg, CHART_IMAGES_DIR)
+    chart_manifest_df.to_csv(chart_manifest_path, index=False)
+    selected_chart_rows = build_chart_pdf_for_screening(
+        final_df,
+        price_wide,
+        cfg,
+        pdf_path,
+        start_rank=chart_start_rank,
+        end_rank=chart_end_rank,
+    )
 
     print("8) Building per-ticker agent data packages (Yahoo + SEC)...")
-    package_manifest_df = build_agents_data_packages(final_df, price_wide, universe_meta, cfg)
+    package_manifest_df = build_agents_data_packages(package_df, price_wide, universe_meta, cfg)
     package_manifest_path = SCREENING_OUTPUT_DIR / "agents_data_package_manifest.csv"
     package_manifest_df.to_csv(package_manifest_path, index=False)
+
+    mongo = get_mongo_store()
+    screening_run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if mongo is not None:
+        mongo.upsert_global_cache(
+            "latest_screening_snapshot",
+            {
+                "screening_run_id": screening_run_id,
+                "universe_size": int(len(universe_meta)),
+                "technical_rows": int(len(technical_df)),
+                "final_rows": int(len(final_df)),
+                "latest_market_day": str(get_latest_market_trading_day().date()),
+                "final_ranked_stocks": final_df.to_dict(orient="records"),
+                "chart_manifest": chart_manifest_df.to_dict(orient="records"),
+                "artifact_paths": {
+                    "final_feather": str(feather_path),
+                    "final_csv": str(csv_path),
+                    "chart_manifest_csv": str(chart_manifest_path),
+                    "screening_pdf": str(pdf_path),
+                    "package_manifest_csv": str(package_manifest_path),
+                },
+                "selected_package_tickers": package_df[["Ticker", "screen_rank"]].to_dict(orient="records"),
+            },
+        )
+        mongo.upsert_screening_run(
+            screening_run_id,
+            {
+                "created_at": datetime.utcnow().isoformat(),
+                "config": vars(cfg),
+                "chart_range": {
+                    "start_rank": int(chart_start_rank),
+                    "end_rank": int(chart_end_rank),
+                },
+                "package_range": {
+                    "start_rank": int(package_start_rank),
+                    "end_rank": int(package_end_rank),
+                },
+                "technical_rows": int(len(technical_df)),
+                "final_rows": int(len(final_df)),
+                "selected_chart_tickers": selected_chart_rows.to_dict(orient="records"),
+                "selected_package_tickers": package_df[["Ticker", "screen_rank"]].to_dict(orient="records"),
+                "final_ranked_stocks": final_df.to_dict(orient="records"),
+                "artifact_paths": {
+                    "final_feather": str(feather_path),
+                    "final_csv": str(csv_path),
+                    "screening_pdf": str(pdf_path),
+                    "chart_manifest_csv": str(chart_manifest_path),
+                    "package_manifest_csv": str(package_manifest_path),
+                },
+            },
+        )
 
     print("Done.")
     print(f"Technical rows: {len(technical_df)}")
@@ -1430,6 +1612,7 @@ def main() -> None:
     print(f"Final deduped rows: {len(final_df)}")
     print(f"Saved final feather: {feather_path}")
     print(f"Saved final csv: {csv_path}")
+    print(f"Saved chart manifest: {chart_manifest_path}")
     print(f"Saved charts pdf: {pdf_path}")
     print(f"Saved data package manifest: {package_manifest_path}")
     print(f"Saved data packages root: {AGENTS_DATA_PACKAGE_DIR}")

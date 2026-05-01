@@ -8,14 +8,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import matplotlib.image as mpimg
+import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+from matplotlib.backends.backend_pdf import PdfPages
+
+from mongo_store import get_mongo_store
 
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
 SCREENING_FEATHER = BASE_DIR / "screening_output" / "final_screening_union.feather"
+CHART_MANIFEST_CSV = BASE_DIR / "screening_output" / "chart_manifest.csv"
 AGENTS_DATA_PACKAGE_DIR = BASE_DIR / "agents_data_package"
 OUTPUT_ROOT = BASE_DIR / "output" / "agent_runs"
 
@@ -64,12 +70,17 @@ FINAL_JSON:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run per-ticker analyst agents.")
-    parser.add_argument("--top-n", type=int, default=5, help="Number of tickers to run.")
     parser.add_argument(
-        "--offset",
+        "--start-rank",
         type=int,
-        default=0,
-        help="Skip the first N ranked tickers before selecting.",
+        default=1,
+        help="Starting screener rank to analyze.",
+    )
+    parser.add_argument(
+        "--end-rank",
+        type=int,
+        default=5,
+        help="Ending screener rank to analyze.",
     )
     parser.add_argument("--max-workers", type=int, default=2, help="Concurrent per-ticker agent calls.")
     parser.add_argument("--model", type=str, default=os.getenv("OPENAI_MODEL", "gpt-5.4-mini"))
@@ -81,6 +92,8 @@ def parse_args() -> argparse.Namespace:
         help="Responses web search tool type.",
     )
     parser.add_argument("--run-id", type=str, default=None, help="Optional run id override.")
+    parser.add_argument("--user-id", type=str, default="local-user", help="Application user id for session storage.")
+    parser.add_argument("--user-email", type=str, default="", help="Optional user email for session storage.")
     parser.add_argument(
         "--include-feather",
         action="store_true",
@@ -119,13 +132,40 @@ def build_run_dirs(run_id: Optional[str]) -> Dict[str, Path]:
     run_name = run_id or ts
     root = OUTPUT_ROOT / run_name
     per_stock = root / "per_stock"
+    charts = root / "charts"
     uploaded = root / "uploaded_file_manifest"
-    for d in [root, per_stock, uploaded]:
+    for d in [root, per_stock, charts, uploaded]:
         d.mkdir(parents=True, exist_ok=True)
-    return {"root": root, "per_stock": per_stock, "uploaded": uploaded}
+    return {"root": root, "per_stock": per_stock, "charts": charts, "uploaded": uploaded}
 
 
-def load_top_tickers(path: Path, top_n: int, offset: int = 0, skip_tickers: Optional[set] = None) -> List[str]:
+def resolve_rank_bounds(total_count: int, start_rank: int, end_rank: int, label: str) -> tuple[int, int]:
+    if total_count <= 0:
+        raise ValueError(f"No screened stocks are available for {label}.")
+
+    normalized_start = max(1, int(start_rank))
+    if normalized_start != int(start_rank):
+        print(f"{label}: adjusted start rank from {start_rank} to {normalized_start}.")
+
+    if normalized_start > total_count:
+        raise ValueError(
+            f"{label}: start rank {normalized_start} exceeds available screened stocks ({total_count})."
+        )
+
+    normalized_end = max(normalized_start, int(end_rank))
+    if normalized_end > total_count:
+        print(f"{label}: adjusted end rank from {normalized_end} to {total_count}.")
+        normalized_end = total_count
+
+    return normalized_start, normalized_end
+
+
+def load_ranked_tickers(
+    path: Path,
+    start_rank: int,
+    end_rank: int,
+    skip_tickers: Optional[set] = None,
+) -> List[Dict[str, object]]:
     if not path.exists():
         raise FileNotFoundError(f"Missing screening feather: {path}")
     df = pd.read_feather(path)
@@ -135,16 +175,18 @@ def load_top_tickers(path: Path, top_n: int, offset: int = 0, skip_tickers: Opti
         df = df.sort_values("combined_score", ascending=False, kind="stable")
     elif "technical_score" in df.columns:
         df = df.sort_values("technical_score", ascending=False, kind="stable")
-    tickers = df["Ticker"].dropna().astype(str).str.upper().drop_duplicates().tolist()
-    if offset > 0:
-        tickers = tickers[offset:]
+    df = df.dropna(subset=["Ticker"]).copy()
+    df["Ticker"] = df["Ticker"].astype(str).str.upper()
+    df = df.drop_duplicates(subset=["Ticker"]).reset_index(drop=True)
+    df["screen_rank"] = range(1, len(df) + 1)
+
+    start_rank, end_rank = resolve_rank_bounds(len(df), start_rank, end_rank, label="Analysis range")
+    df = df[(df["screen_rank"] >= start_rank) & (df["screen_rank"] <= end_rank)].copy()
     if skip_tickers:
-        tickers = [t for t in tickers if t not in skip_tickers]
-    if top_n > 0:
-        tickers = tickers[:top_n]
-    if not tickers:
+        df = df[~df["Ticker"].isin(skip_tickers)].copy()
+    if df.empty:
         raise ValueError("No tickers found in screening feather.")
-    return tickers
+    return df.to_dict(orient="records")
 
 
 def list_ticker_package_files(
@@ -354,8 +396,64 @@ def sanitize_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
 
 
+def make_json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): make_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [make_json_safe(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if hasattr(value, "item") and callable(getattr(value, "item")):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def create_session_chart_bundle(run_dirs: Dict[str, Path], selected_rows: List[Dict[str, object]]) -> Dict[str, object]:
+    chart_paths = []
+    if CHART_MANIFEST_CSV.exists():
+        chart_df = pd.read_csv(CHART_MANIFEST_CSV)
+        if {"Ticker", "chart_image_path"}.issubset(chart_df.columns):
+            chart_df["Ticker"] = chart_df["Ticker"].astype(str).str.upper()
+            selected_tickers = [str(row["Ticker"]).upper() for row in selected_rows]
+            chart_paths = (
+                chart_df[chart_df["Ticker"].isin(selected_tickers)]
+                .sort_values("screen_rank" if "screen_rank" in chart_df.columns else "Ticker")
+                ["chart_image_path"]
+                .dropna()
+                .astype(str)
+                .tolist()
+            )
+
+    pdf_path = run_dirs["charts"] / "selected_screening_charts.pdf"
+    included = []
+    if chart_paths:
+        with PdfPages(pdf_path) as pdf:
+            for chart_path in chart_paths:
+                image_path = Path(chart_path)
+                if not image_path.exists():
+                    continue
+                img = mpimg.imread(image_path)
+                fig, ax = plt.subplots(figsize=(12, 6))
+                ax.imshow(img)
+                ax.axis("off")
+                fig.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+                included.append(str(image_path))
+
+    return {
+        "chart_pdf_path": str(pdf_path) if included else "",
+        "chart_image_paths": included,
+    }
+
+
 def run_one_ticker(
-    ticker: str,
+    ticker_row: Dict[str, object],
     run_dirs: Dict[str, Path],
     api_key: str,
     model: str,
@@ -365,8 +463,20 @@ def run_one_ticker(
     max_sec_html_files: int,
     max_file_size_mb: float,
 ) -> dict:
+    ticker = str(ticker_row["Ticker"]).upper()
     started = time.time()
-    out = {"ticker": ticker, "status": "ok", "error": "", "n_files_uploaded": 0, "elapsed_sec": None}
+    out = {
+        "ticker": ticker,
+        "screen_rank": int(ticker_row.get("screen_rank", -1)),
+        "status": "ok",
+        "error": "",
+        "n_files_uploaded": 0,
+        "elapsed_sec": None,
+        "text_path": "",
+        "json_path": "",
+        "raw_path": "",
+        "parsed_report": None,
+    }
     ticker_dir = run_dirs["per_stock"] / ticker
     ticker_dir.mkdir(parents=True, exist_ok=True)
 
@@ -434,6 +544,10 @@ def run_one_ticker(
         parsed = extract_final_json_block(text)
         if parsed is not None:
             json_path.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
+        out["text_path"] = str(txt_path)
+        out["json_path"] = str(json_path) if parsed is not None else ""
+        out["raw_path"] = str(raw_path)
+        out["parsed_report"] = parsed
     except Exception as exc:
         out["status"] = "error"
         out["error"] = str(exc)
@@ -443,21 +557,67 @@ def run_one_ticker(
     return out
 
 
+def concatenate_ticker_reports(run_dirs: Dict[str, Path], selected_rows: List[Dict[str, object]]) -> Dict[str, object]:
+    blocks = []
+    included = []
+    for row in selected_rows:
+        ticker = str(row["Ticker"]).upper()
+        rank = int(row["screen_rank"])
+        txt_path = run_dirs["per_stock"] / ticker / f"{ticker}.txt"
+        if not txt_path.exists():
+            continue
+        blocks.append(f"===== Rank {rank} | {ticker} =====\n\n{txt_path.read_text(encoding='utf-8')}")
+        included.append(ticker)
+    combined_text = "\n\n".join(blocks)
+    output_path = run_dirs["root"] / "combined_per_stock_reports.txt"
+    output_path.write_text(combined_text, encoding="utf-8")
+    return {"combined_text": combined_text, "combined_path": str(output_path), "included_tickers": included}
+
+
 def main() -> None:
     args = parse_args()
     api_key = get_api_key()
+    mongo = get_mongo_store()
+    if mongo is not None and args.user_id:
+        mongo.upsert_user(args.user_id, email=(args.user_email or None))
 
     run_dirs = build_run_dirs(args.run_id)
 
     skip_tickers = {t.strip().upper() for t in args.skip_tickers.split(",") if t.strip()}
-    tickers = load_top_tickers(
+    selected_rows = load_ranked_tickers(
         SCREENING_FEATHER,
-        top_n=args.top_n,
-        offset=max(0, int(args.offset)),
+        start_rank=max(1, int(args.start_rank)),
+        end_rank=max(1, int(args.end_rank)),
         skip_tickers=skip_tickers,
     )
+    tickers = [str(row["Ticker"]).upper() for row in selected_rows]
+    chart_bundle = create_session_chart_bundle(run_dirs, selected_rows)
+    session_key = run_dirs["root"].name
+    mongo_session_id = None
+    if mongo is not None:
+        mongo_session_id = mongo.create_analysis_session(
+            make_json_safe(
+                {
+                    "session_key": session_key,
+                    "user_id": args.user_id,
+                    "user_email": args.user_email or None,
+                    "run_dir": str(run_dirs["root"]),
+                    "start_rank": int(args.start_rank),
+                "end_rank": int(args.end_rank),
+                "selected_tickers": tickers,
+                "selected_rows": selected_rows,
+                    "chart_artifacts": chart_bundle,
+                    "status": "running",
+                    "model": args.model,
+                    "reasoning_effort": args.reasoning_effort,
+                }
+            )
+        )
     print(f"Run folder: {run_dirs['root']}")
-    print(f"Tickers ({len(tickers)}): {', '.join(tickers)}")
+    print(
+        f"Tickers ({len(tickers)}) | ranks {int(args.start_rank)}-{int(args.end_rank)}: "
+        f"{', '.join(tickers)}"
+    )
 
     worker_count = min(max(1, args.max_workers), len(tickers))
     results = []
@@ -465,7 +625,7 @@ def main() -> None:
         futures = [
             executor.submit(
                 run_one_ticker,
-                ticker=t,
+                ticker_row=row,
                 run_dirs=run_dirs,
                 api_key=api_key,
                 model=args.model,
@@ -475,32 +635,76 @@ def main() -> None:
                 max_sec_html_files=int(args.max_sec_html_files),
                 max_file_size_mb=float(args.max_file_size_mb),
             )
-            for t in tickers
+            for row in selected_rows
         ]
         for future in as_completed(futures):
             item = future.result()
             results.append(item)
             print(
-                f"[{item['ticker']}] status={item['status']} files={item['n_files_uploaded']} "
+                f"[rank {item['screen_rank']} | {item['ticker']}] status={item['status']} files={item['n_files_uploaded']} "
                 f"elapsed={item['elapsed_sec']}s"
             )
+            if mongo is not None and mongo_session_id is not None:
+                mongo.upsert_stock_report(
+                    mongo_session_id,
+                    item["ticker"],
+                    {
+                        "screen_rank": item["screen_rank"],
+                        "status": item["status"],
+                        "error": item["error"],
+                        "text_path": item["text_path"],
+                        "json_path": item["json_path"],
+                        "raw_path": item["raw_path"],
+                        "report_json": item["parsed_report"],
+                    },
+                )
 
     manifest_path = run_dirs["root"] / "run_manifest.json"
+    combined = concatenate_ticker_reports(run_dirs, selected_rows)
     manifest = {
         "created_at": datetime.now().isoformat(),
-        "top_n": args.top_n,
+        "start_rank": args.start_rank,
+        "end_rank": args.end_rank,
         "tickers": tickers,
+        "selected_rows": selected_rows,
         "model": args.model,
         "reasoning_effort": args.reasoning_effort,
         "web_tool_type": args.web_tool_type,
+        "chart_bundle": chart_bundle,
+        "combined_reports_path": combined["combined_path"],
         "results": sorted(results, key=lambda x: x["ticker"]),
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    manifest_path.write_text(json.dumps(make_json_safe(manifest), indent=2), encoding="utf-8")
 
     ok_tickers = [r["ticker"] for r in results if r["status"] == "ok"]
     if not ok_tickers:
+        if mongo is not None and mongo_session_id is not None:
+            mongo.update_analysis_session(
+                mongo_session_id,
+            {
+                "status": "error",
+                "manifest_path": str(manifest_path),
+                "combined_reports_path": combined["combined_path"],
+                "results": make_json_safe(results),
+            },
+        )
         raise RuntimeError("All per-ticker agent runs failed.")
+    if mongo is not None and mongo_session_id is not None:
+        mongo.update_analysis_session(
+            mongo_session_id,
+            {
+                "status": "completed",
+                "manifest_path": str(manifest_path),
+                "combined_reports_path": combined["combined_path"],
+                "included_tickers": combined["included_tickers"],
+                "successful_tickers": sorted(ok_tickers),
+                "results": make_json_safe(results),
+            },
+        )
     print(f"Saved run manifest: {manifest_path}")
+    print(f"Saved combined reports: {combined['combined_path']}")
+    if chart_bundle["chart_pdf_path"]:
+        print(f"Saved selected chart pdf: {chart_bundle['chart_pdf_path']}")
     print(f"Successful per-ticker reports: {len(ok_tickers)} ({', '.join(sorted(ok_tickers))})")
 
 

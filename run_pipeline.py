@@ -44,12 +44,24 @@ def parse_args() -> argparse.Namespace:
     )
 
     # agent_workflow.py options
-    parser.add_argument("--top-n", type=int, default=5, help="Number of ranked tickers to analyze.")
+    parser.add_argument("--top-n", type=int, default=0, help="Legacy shortcut for rank 1 through N.")
     parser.add_argument(
         "--offset",
         type=int,
         default=0,
-        help="Skip the first N ranked tickers before analyst selection.",
+        help="Legacy offset used with --top-n.",
+    )
+    parser.add_argument(
+        "--start-rank",
+        type=int,
+        default=1,
+        help="Starting screener rank for analyst selection.",
+    )
+    parser.add_argument(
+        "--end-rank",
+        type=int,
+        default=3,
+        help="Ending screener rank for analyst selection.",
     )
     parser.add_argument(
         "--max-workers",
@@ -72,6 +84,8 @@ def parse_args() -> argparse.Namespace:
         help="Override web tool type for agent_workflow.py.",
     )
     parser.add_argument("--run-id", type=str, default=None, help="Optional run id override for analyst outputs.")
+    parser.add_argument("--user-id", type=str, default="local-user", help="Application user id for session storage.")
+    parser.add_argument("--user-email", type=str, default="", help="Optional user email for session storage.")
     parser.add_argument(
         "--include-feather",
         action="store_true",
@@ -108,7 +122,17 @@ def run_step(label: str, cmd: list[str], pbar: tqdm) -> None:
     pbar.update(1)
 
 
+def resolve_selection_bounds(args: argparse.Namespace) -> tuple[int, int]:
+    start_rank = max(1, int(args.start_rank))
+    end_rank = max(start_rank, int(args.end_rank))
+    if args.top_n > 0:
+        start_rank = max(1, int(args.offset) + 1)
+        end_rank = start_rank + int(args.top_n) - 1
+    return start_rank, end_rank
+
+
 def build_stocks_cmd(args: argparse.Namespace) -> list[str]:
+    start_rank, end_rank = resolve_selection_bounds(args)
     cmd = [sys.executable, str(STOCKS_SCRIPT)]
     if args.refresh_metadata:
         cmd.append("--refresh-metadata")
@@ -116,17 +140,31 @@ def build_stocks_cmd(args: argparse.Namespace) -> list[str]:
         cmd.extend(["--metadata-refresh-days", str(args.metadata_refresh_days)])
     if args.refresh_insider:
         cmd.append("--refresh-insider")
+    cmd.extend(
+        [
+            "--chart-start-rank",
+            str(start_rank),
+            "--chart-end-rank",
+            str(end_rank),
+            "--package-start-rank",
+            str(start_rank),
+            "--package-end-rank",
+            str(end_rank),
+        ]
+    )
     return cmd
 
 
 def build_agents_cmd(args: argparse.Namespace) -> list[str]:
+    start_rank, end_rank = resolve_selection_bounds(args)
+
     cmd = [
         sys.executable,
         str(AGENT_WORKFLOW_SCRIPT),
-        "--top-n",
-        str(args.top_n),
-        "--offset",
-        str(args.offset),
+        "--start-rank",
+        str(start_rank),
+        "--end-rank",
+        str(end_rank),
         "--max-workers",
         str(args.max_workers),
         "--reasoning-effort",
@@ -142,6 +180,10 @@ def build_agents_cmd(args: argparse.Namespace) -> list[str]:
         cmd.extend(["--web-tool-type", args.web_tool_type])
     if args.run_id:
         cmd.extend(["--run-id", args.run_id])
+    if args.user_id:
+        cmd.extend(["--user-id", args.user_id])
+    if args.user_email:
+        cmd.extend(["--user-email", args.user_email])
     if args.include_feather:
         cmd.append("--include-feather")
     if args.skip_tickers:

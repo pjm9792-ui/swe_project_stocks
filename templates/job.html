@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Running Analysis{% endblock %}
+{% block content %}
+<h1>Running Analysis</h1>
+
+<div class="card">
+  <p><strong>Run ID:</strong> {{ job.run_id }}</p>
+  <p><strong>Rank Range:</strong> {{ job.start_rank }}-{{ job.end_rank }}</p>
+  <p><strong>Status:</strong> <span id="job-status">{{ job.status }}</span></p>
+</div>
+
+<div class="card">
+  <h2>Live Output</h2>
+  <pre id="log-box">Waiting for output...</pre>
+</div>
+
+<div class="card" id="results-link-box" style="display:none;">
+  <a id="results-link" href="#">Open Results</a>
+</div>
+
+<script>
+  async function refreshJob() {
+    const statusResp = await fetch("{{ url_for('job_status', job_id=job.job_id) }}");
+    const statusData = await statusResp.json();
+    document.getElementById("job-status").textContent = statusData.status;
+
+    const logsResp = await fetch("{{ url_for('job_logs', job_id=job.job_id) }}");
+    const logsData = await logsResp.json();
+    document.getElementById("log-box").textContent = logsData.text || "No output yet.";
+
+    if (statusData.status === "completed") {
+      const box = document.getElementById("results-link-box");
+      const link = document.getElementById("results-link");
+      link.href = statusData.results_url;
+      box.style.display = "block";
+      clearInterval(window.jobTimer);
+    }
+    if (statusData.status === "error") {
+      clearInterval(window.jobTimer);
+    }
+  }
+
+  refreshJob();
+  window.jobTimer = setInterval(refreshJob, 3000);
+</script>
+{% endblock %}

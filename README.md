@@ -3,7 +3,7 @@
 This project is a two-stage stock research pipeline:
 
 1. `stocks.py` builds a U.S. equity universe, refreshes cached market data, runs a momentum + insider-buying screen, and packages per-ticker research files.
-2. `agent_workflow.py` takes those ticker packages and sends them to the OpenAI API to generate structured analyst writeups.
+2. `agent_workflow.py` takes a selected screener rank range and sends those ticker packages to the OpenAI API to generate structured analyst writeups.
 
 `run_pipeline.py` is a convenience wrapper that runs both stages in sequence.
 
@@ -18,8 +18,9 @@ The idea is not "find random cheap stocks." The strategy is closer to:
 - Export a final union of:
   - technically strong names
   - names with unusually strong insider buying
-- Build a research package per ticker with Yahoo Finance snapshots, price history, and selected SEC filings.
+- Build a research package per ticker with Yahoo Finance snapshots, price history, selected SEC filings, and chart artifacts.
 - Feed those packages to an LLM analyst prompt that tries to answer: "Is this a real but still incomplete repricing, or is the move already priced in?"
+- Optionally persist screening runs, analysis sessions, and stock reports into MongoDB when `MONGODB_URI` is configured.
 
 This is a research workflow, not a production trading system or a validated alpha engine.
 
@@ -59,6 +60,8 @@ Optional environment variables:
 OPENAI_MODEL=gpt-5.4-mini
 OPENAI_WEB_TOOL_TYPE=web_search_preview
 SEC_USER_AGENT=YourName your_email@example.com
+MONGODB_URI=your_mongodb_atlas_uri
+MONGODB_DB_NAME=stocks_app
 ```
 
 ## Usage
@@ -69,24 +72,30 @@ Run only the stock screening / package builder:
 python stocks.py
 ```
 
-Run only the analyst workflow on the top 3 names:
+Run only the analyst workflow on screener ranks 1 through 3:
 
 ```bash
-python agent_workflow.py --top-n 3
+python agent_workflow.py --start-rank 1 --end-rank 3
 ```
 
 Run the full pipeline end-to-end:
 
 ```bash
-python run_pipeline.py --top-n 3
+python run_pipeline.py --start-rank 1 --end-rank 3
+```
+
+Run the bare-bones Flask app:
+
+```bash
+python app.py
 ```
 
 Useful options:
 
 ```bash
 python stocks.py --refresh-metadata --refresh-insider
-python run_pipeline.py --skip-stocks --top-n 3
-python agent_workflow.py --top-n 3 --max-workers 2
+python run_pipeline.py --skip-stocks --start-rank 1 --end-rank 3
+python agent_workflow.py --start-rank 10 --end-rank 20 --max-workers 2
 ```
 
 ## Outputs
@@ -102,7 +111,22 @@ python agent_workflow.py --top-n 3 --max-workers 2
 - per-ticker raw API responses
 - per-ticker text writeups
 - parsed JSON summaries
+- a combined session report text file
+- a selected-range chart PDF bundle
 - run manifests in `output/agent_runs/`
+
+When MongoDB is configured, the app can also persist:
+
+- global screening snapshots
+- analysis sessions
+- per-stock report records
+
+The Flask app provides:
+
+- register / login
+- dashboard with rank-range selection
+- live log polling while analysis runs
+- results page with combined report text and saved chart artifacts
 
 ## Notes
 

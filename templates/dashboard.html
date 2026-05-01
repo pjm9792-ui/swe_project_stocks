@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<h1>Stocks Screener Dashboard</h1>
+
+<div class="card">
+  <h2>Start Analysis</h2>
+  <p>Users must go through the screener. Choose a screener rank range and start a new session.</p>
+  <form method="post" action="{{ url_for('start_analysis') }}">
+    <div>
+      <label>Start Rank</label><br>
+      <input type="number" name="start_rank" value="1" min="1" required>
+    </div>
+    <div>
+      <label>End Rank</label><br>
+      <input type="number" name="end_rank" value="3" min="1" required>
+    </div>
+    <button type="submit">Run Analysis</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Prior Sessions</h2>
+  {% if jobs %}
+    <table>
+      <thead>
+        <tr>
+          <th>Run ID</th>
+          <th>Ranks</th>
+          <th>Status</th>
+          <th>Created</th>
+          <th>Open</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in jobs %}
+          <tr>
+            <td>{{ job.run_id }}</td>
+            <td>{{ job.start_rank }}-{{ job.end_rank }}</td>
+            <td>{{ job.status }}</td>
+            <td>{{ job.created_at }}</td>
+            <td>
+              {% if job.status == "completed" %}
+                <a href="{{ url_for('job_results', job_id=job.job_id) }}">Results</a>
+              {% else %}
+                <a href="{{ url_for('job_detail', job_id=job.job_id) }}">View</a>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p>No sessions yet.</p>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Configuration Needed{% endblock %}
+{% block content %}
+<h1>MongoDB Configuration Needed</h1>
+<div class="card">
+  <p>This Flask app expects MongoDB to be configured before login and session tracking can work.</p>
+  <p>Add these values to your <code>.env</code> file:</p>
+  <pre>MONGODB_URI=your_mongodb_atlas_uri
+MONGODB_DB_NAME=stocks_app
+FLASK_SECRET_KEY=your_random_secret</pre>
+  <p>Then install dependencies if needed:</p>
+  <pre>pip install -r requirements.txt</pre>
+</div>
+{% endblock %}
