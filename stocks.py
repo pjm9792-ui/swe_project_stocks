@@ -1021,7 +1021,7 @@ def _build_chart_figure(row: pd.Series, price_wide: pd.DataFrame, cfg: PipelineC
     ticker = str(row["Ticker"]).upper()
     if ticker not in price_wide.columns:
         return None
-    s = price_wide[ticker].dropna()
+    s = pd.to_numeric(price_wide[ticker], errors="coerce").dropna()
     s = s[s.index >= target_start]
     if len(s) < max(20, cfg.min_trading_days):
         return None
@@ -1035,7 +1035,7 @@ def _build_chart_figure(row: pd.Series, price_wide: pd.DataFrame, cfg: PipelineC
     if len(old_s) < 5 or len(recent_s) < 5:
         return None
 
-    log_s = np.log(s)
+    log_s = np.log(s.to_numpy(dtype=float))
 
     x_old = np.arange(len(old_s))
     y_old = np.log(old_s.values)
@@ -1048,7 +1048,7 @@ def _build_chart_figure(row: pd.Series, price_wide: pd.DataFrame, cfg: PipelineC
     yhat_recent = reg_recent.intercept + reg_recent.slope * x_recent
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(s.index, log_s.values, label="Actual log-price", linewidth=2)
+    ax.plot(s.index, log_s, label="Actual log-price", linewidth=2)
     ax.plot(old_s.index, yhat_old, label=f"Old-half fit | slope={reg_old.slope:.5f}, R2={reg_old.rvalue**2:.3f}", linewidth=2)
     ax.plot(recent_s.index, yhat_recent, label=f"Recent-half fit | slope={reg_recent.slope:.5f}, R2={reg_recent.rvalue**2:.3f}", linewidth=2)
     ax.axvline(s.index[mid], linestyle="--", alpha=0.7, label="Split point")
